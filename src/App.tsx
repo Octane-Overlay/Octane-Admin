@@ -4,6 +4,7 @@ import './App.css';
 const BRIDGE_URL = 'http://127.0.0.1:49124';
 const META_ENDPOINT = `${BRIDGE_URL}/meta`;
 const POST_DEBOUNCE_MS = 250;
+const RECONNECT_INTERVAL_MS = 3000;
 const MAX_LOGO_BYTES = 500_000;
 const BEST_OF_OPTIONS = [1, 3, 5, 7, 9];
 
@@ -27,14 +28,15 @@ const DEFAULT_META: Meta = {
   orange: { name: '', logo: '', wins: 0 },
 };
 
-type Status = 'loading' | 'ready' | 'saving' | 'error';
+type Status = 'connecting' | 'connected' | 'saving' | 'disconnected';
 
 function App() {
   const [meta, setMeta] = useState<Meta>(DEFAULT_META);
-  const [status, setStatus] = useState<Status>('loading');
+  const [status, setStatus] = useState<Status>('connecting');
+  const [everConnected, setEverConnected] = useState(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const postTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const skipNextPost = useRef(true);
+  const lastSavedRef = useRef<string | null>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -45,13 +47,17 @@ function App() {
       })
       .then((data: Meta) => {
         if (cancelled) return;
-        setMeta({ ...DEFAULT_META, ...data });
-        setStatus('ready');
+        const next = { ...DEFAULT_META, ...data };
+        lastSavedRef.current = JSON.stringify(next);
+        setMeta(next);
+        setStatus('connected');
+        setEverConnected(true);
+        setErrorMsg(null);
       })
       .catch((err: Error) => {
         if (cancelled) return;
         setErrorMsg(err.message);
-        setStatus('error');
+        setStatus('disconnected');
       });
     return () => {
       cancelled = true;
@@ -59,11 +65,35 @@ function App() {
   }, []);
 
   useEffect(() => {
-    if (skipNextPost.current) {
-      skipNextPost.current = false;
-      return;
-    }
-    if (status === 'loading' || status === 'error') return;
+    if (status !== 'disconnected') return;
+    const id = setInterval(() => {
+      fetch(META_ENDPOINT)
+        .then((res) => {
+          if (!res.ok) throw new Error(`GET /meta returned ${res.status}`);
+          return res.json();
+        })
+        .then((data: Meta) => {
+          const next = { ...DEFAULT_META, ...data };
+          const localSerialized = JSON.stringify(meta);
+          if (localSerialized === lastSavedRef.current) {
+            lastSavedRef.current = JSON.stringify(next);
+            setMeta(next);
+          }
+          setStatus('connected');
+          setEverConnected(true);
+          setErrorMsg(null);
+        })
+        .catch(() => {
+          // bridge still down; keep polling
+        });
+    }, RECONNECT_INTERVAL_MS);
+    return () => clearInterval(id);
+  }, [status, meta]);
+
+  useEffect(() => {
+    if (status === 'connecting') return;
+    const serialized = JSON.stringify(meta);
+    if (serialized === lastSavedRef.current) return;
 
     if (postTimer.current) clearTimeout(postTimer.current);
     postTimer.current = setTimeout(() => {
@@ -71,16 +101,17 @@ function App() {
       fetch(META_ENDPOINT, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(meta),
+        body: serialized,
       })
         .then((res) => {
           if (!res.ok) throw new Error(`POST /meta returned ${res.status}`);
-          setStatus('ready');
+          lastSavedRef.current = serialized;
+          setStatus('connected');
           setErrorMsg(null);
         })
         .catch((err: Error) => {
           setErrorMsg(err.message);
-          setStatus('error');
+          setStatus('disconnected');
         });
     }, POST_DEBOUNCE_MS);
 
@@ -112,11 +143,18 @@ function App() {
 
   const winsNeeded = Math.ceil(meta.bestOf / 2);
 
-  if (status === 'loading') {
+  if (!everConnected) {
     return (
       <div className="control-panel">
         <h1>Overlay controls</h1>
-        <p className="control-hint">Connecting to bridge at <code>{META_ENDPOINT}</code>…</p>
+        <div className="control-status">
+          <ConnectionBadge status={status} error={errorMsg} />
+        </div>
+        <p className="control-hint">
+          {status === 'disconnected'
+            ? <>Could not reach the bridge at <code>{META_ENDPOINT}</code>. Is the Bridge running? Retrying every {RECONNECT_INTERVAL_MS / 1000}s…</>
+            : <>Connecting to bridge at <code>{META_ENDPOINT}</code>…</>}
+        </p>
       </div>
     );
   }
@@ -128,7 +166,7 @@ function App() {
         Talking to <code>{META_ENDPOINT}</code>. Changes are saved automatically; the overlay updates live.
       </p>
       <div className="control-status">
-        <StatusBadge status={status} error={errorMsg} />
+        <ConnectionBadge status={status} error={errorMsg} />
       </div>
 
       <div className="control-section">
@@ -221,10 +259,21 @@ function App() {
   );
 }
 
-function StatusBadge({ status, error }: { status: Status; error: string | null }) {
-  if (status === 'saving') return <span className="status-badge status-saving">saving…</span>;
-  if (status === 'error') return <span className="status-badge status-error">error: {error ?? 'unknown'}</span>;
-  return <span className="status-badge status-ready">saved</span>;
+function ConnectionBadge({ status, error }: { status: Status; error: string | null }) {
+  if (status === 'connecting') {
+    return <span className="status-badge status-connecting">connecting…</span>;
+  }
+  if (status === 'saving') {
+    return <span className="status-badge status-saving">saving…</span>;
+  }
+  if (status === 'disconnected') {
+    return (
+      <span className="status-badge status-disconnected">
+        not connected — is the Bridge running?{error ? ` (${error})` : ''}
+      </span>
+    );
+  }
+  return <span className="status-badge status-connected">connection established</span>;
 }
 
 export default App;
